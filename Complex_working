@@ -1,0 +1,669 @@
+import json
+import re
+import time
+import traceback
+import pandas as pd
+
+from google import genai
+from google.genai.types import GenerateContentConfig, GoogleSearch, HttpOptions, Tool
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+PROJECT_ID = "labs-491605"
+LOCATION = "global"
+MODEL_NAME = "gemini-2.5-flash"
+
+INPUT_FILE = "ADC Grid.xlsx"
+OUTPUT_FILE = "ADC_Verified_Final_Output.xlsx"
+
+MAX_ROWS_TO_PROCESS = None   # use 5 for testing, None for all rows
+UNKNOWN = "[UNKNOWN]"
+
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 5
+ROW_DELAY_SECONDS = 2
+
+
+# ============================================================
+# INPUT COLUMNS
+# ============================================================
+
+INPUT_COLUMNS = [
+    "record_id",
+    "product_id",
+    "abstract_title",
+    "citation",
+    "first_author",
+    "abstract_url",
+    "review_status",
+]
+
+
+# ============================================================
+# NORMALIZATION RULES
+# ============================================================
+
+RULES_TEXT = """
+modality: ADC
+asset_stage: discovery | preclinical | phase_1 | phase_2 | phase_3 | approved | discontinued
+target_antigen: HER2 | TROP2 | NECTIN4 | EGFR | EGFRxHER3 | B7H3 | FRalpha | PTK7
+indication: mTNBC | breast_cancer | urothelial_cancer | nsclc | ovarian_cancer | solid_tumor
+line_of_therapy: neoadjuvant | 1L | 2L | mixed_1L_and_later | 2L_3L_mixed | 3L_plus | post_standard_of_care | post_platinum | post_checkpoint
+moa_class: Topo-I payload | microtubule inhibitor | DNA alkylator | immune agonist payload
+payload_class: Topo-I | MMAE | MMAF | DM1 | PBD | duocarmycin
+payload_potency_bin: low | moderate | high | ultra_high
+payload_half_life_bin: short | medium | long
+dar_bin: 2 | 4 | 6 | 8
+linker_type: cleavable | non-cleavable
+linker_stability_bin: unstable | moderate | stable | highly_stable
+conjugation_type: stochastic | site-specific
+dosing_interval: q1w | q2w | q3w | q4w
+median_pfs_bin: <6 mo | 6-7.5 mo | 7.5-8.5 mo | 8.5-9.0 mo | >9.0 mo
+orr_bin: <20% | 20-35% | 35-50% | 50-65% | >65%
+effect_size_bin: low | moderate | high | very_high
+severe_ild_bin: 0-5% | 5-12% | 12-15% | 15-18% | 18-25% | >25%
+grade_3_4_neutropenia_bin: 0-5% | 5-15% | 15-30% | 30-45% | >45%
+grade_3_4_diarrhea_bin: 0-5% | 5-10% | 10-20% | 20-30% | >30%
+black_box_warning: none | ild | neutropenia | ocular_toxicity | multiple
+stratification: all-comers | biomarker-high | biomarker-positive | niche_subgroup
+biomarker_eligibility: none | PD-L1_positive | PD-L1_ineligible | HER2_negative | IHC_1_plus | IHC_2_plus | IHC_3_plus | genomic_positive
+trial_phase: phase_1 | phase_1_2 | phase_2 | phase_3 | registrational
+trial_size_bin: <100 | 100-250 | 250-500 | 500-1000 | >1000
+target_enrollment_bin: <100 | 100-250 | 250-500 | 500-1000 | >1000
+rd_capital_bin: <20M GBP | 20-40M GBP | 40-75M GBP | 75-150M GBP | >150M GBP
+launch_timeline_bin: <24 months | 24-36 months | 36-48 months | >48 months
+cogs_per_dose_bin: 300-450 GBP | 450-750 GBP | 750-900 GBP | >900 GBP
+target_price_bin: <85k GBP | 85-110k GBP | 110-150k GBP | >150k GBP
+addressable_population_bin: very_small | small | medium | large | very_large
+pts_bin: low | moderate | high | very_high
+outcome: approved | active | discontinued | clinical_hold | no_go
+discontinuation_reason: none | toxicity | efficacy | commercial | manufacturing | strategic
+"""
+
+
+# ============================================================
+# BUILD RULES
+# ============================================================
+
+def parse_rules(rules_text):
+    allowed = {}
+
+    for line in rules_text.strip().splitlines():
+        col, values = line.split(":", 1)
+        col = col.strip()
+        values = [v.strip() for v in values.split("|")]
+        values.append(UNKNOWN)
+        allowed[col] = values
+
+    return allowed
+
+
+ALLOWED = parse_rules(RULES_TEXT)
+OUTPUT_COLUMNS = list(ALLOWED.keys())
+
+AUDIT_COLUMNS = [
+    "source_urls",
+    "review_flag",
+    "unsupported_fields",
+    "evidence_audit",
+]
+
+FINAL_COLUMNS = INPUT_COLUMNS + OUTPUT_COLUMNS + AUDIT_COLUMNS
+
+
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
+client = genai.Client(
+    vertexai=True,
+    project=PROJECT_ID,
+    location=LOCATION,
+    http_options=HttpOptions(api_version="v1"),
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clean_value(value):
+    if value is None:
+        return UNKNOWN
+
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False)
+
+    value = str(value).strip()
+
+    if value == "" or value.lower() == "nan":
+        return UNKNOWN
+
+    return value
+
+
+def clean_column_name(col):
+    col = str(col).strip().lower()
+    col = col.replace(" ", "_")
+    col = col.replace("-", "_")
+    col = col.replace("/", "_")
+    col = col.replace(".", "")
+
+    while "__" in col:
+        col = col.replace("__", "_")
+
+    return col
+
+
+def norm_text(value):
+    return str(value).lower().strip().replace(" ", "_").replace("-", "_")
+
+
+def short_text(value, max_len=250):
+    value = "" if value is None else str(value).strip()
+
+    if len(value) > max_len:
+        return value[:max_len] + "...TRUNCATED"
+
+    return value
+
+
+def safe_excel_text(value, max_len=32000):
+    value = str(value)
+
+    if len(value) > max_len:
+        return value[:max_len] + "...TRUNCATED"
+
+    return value
+
+
+def canonical_value(col, value):
+    value = clean_value(value)
+
+    if value in ALLOWED[col]:
+        return value
+
+    value_norm = norm_text(value)
+
+    for allowed_value in ALLOWED[col]:
+        if value_norm == norm_text(allowed_value):
+            return allowed_value
+
+    return UNKNOWN
+
+
+def extract_json(text):
+    if text is None or str(text).strip() == "":
+        raise ValueError("Empty Gemini response")
+
+    text = str(text).strip()
+    text = text.replace("```json", "")
+    text = text.replace("```JSON", "")
+    text = text.replace("```", "")
+    text = text.strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"No JSON found. Response preview: {text[:500]}")
+
+    json_text = text[start:end + 1]
+
+    return json.loads(json_text)
+
+
+def extract_urls_from_text(text):
+    if not text:
+        return []
+
+    return re.findall(r"https?://[^\s,\]\)\}\"\']+", str(text))
+
+
+def is_redirect_url(url):
+    url = str(url).lower()
+
+    return (
+        "vertexaisearch" in url
+        or "grounding-api-redirect" in url
+        or "google.com/search" in url
+        or "googleusercontent" in url
+    )
+
+
+def clean_source_url(url, fallback_url=""):
+    url = clean_value(url)
+
+    if url == UNKNOWN:
+        return fallback_url
+
+    if is_redirect_url(url):
+        return fallback_url
+
+    return url
+
+
+def extract_grounding_urls(response):
+    urls = []
+
+    try:
+        for candidate in getattr(response, "candidates", []) or []:
+            metadata = getattr(candidate, "grounding_metadata", None)
+
+            if not metadata:
+                continue
+
+            for chunk in getattr(metadata, "grounding_chunks", []) or []:
+                web = getattr(chunk, "web", None)
+
+                if web and getattr(web, "uri", None):
+                    if web.uri not in urls:
+                        urls.append(web.uri)
+
+    except Exception:
+        pass
+
+    return urls
+
+
+def find_input_sheet():
+    excel = pd.ExcelFile(INPUT_FILE)
+
+    print("Available sheets:")
+    for sheet in excel.sheet_names:
+        print(f"- {sheet}")
+
+    for sheet in excel.sheet_names:
+        df = pd.read_excel(INPUT_FILE, sheet_name=sheet)
+        df.columns = [clean_column_name(c) for c in df.columns]
+
+        if set(INPUT_COLUMNS).issubset(set(df.columns)):
+            print(f"Using sheet: {sheet}")
+            return df
+
+    raise ValueError("No sheet found with required input columns")
+
+
+# ============================================================
+# PROMPT
+# ============================================================
+
+def build_prompt(row):
+    row_data = {col: clean_value(row.get(col)) for col in INPUT_COLUMNS}
+
+    expected_json = {}
+
+    for col in OUTPUT_COLUMNS:
+        expected_json[col] = {
+            "value": "allowed value only",
+            "status": "SUPPORTED or INFERRED or UNSUPPORTED or CONFLICT or UNKNOWN",
+            "evidence": "short evidence quote or short inference explanation",
+            "source_url": "direct public source URL",
+        }
+
+    expected_json["source_urls"] = ["direct public url 1", "direct public url 2"]
+    expected_json["review_flag"] = "GOOD or REVIEW or LOW_CONFIDENCE"
+
+    prompt = f"""
+You are a biomedical oncology ADC data normalizer and verifier.
+
+Use Google Search grounding and public sources.
+
+INPUT ROW:
+{json.dumps(row_data, indent=2)}
+
+NORMALIZATION RULES:
+{RULES_TEXT}
+
+RETURN EXACT JSON SHAPE:
+{json.dumps(expected_json, indent=2)}
+
+STRICT OUTPUT RULES:
+1. Return only valid JSON.
+2. Do not use markdown.
+3. Do not explain outside JSON.
+4. Every output column must be present.
+5. Each output column must be an object with value, status, evidence, and source_url.
+6. value must exactly match one allowed value from NORMALIZATION RULES.
+7. Do not return raw numbers; convert numbers into allowed bins.
+8. Use [UNKNOWN] only when the value cannot be found or reasonably inferred.
+9. Keep evidence short, maximum 20 words per field.
+10. source_url must be one URL only.
+
+VERIFICATION RULES:
+11. status = SUPPORTED only if a source directly supports the value.
+12. status = INFERRED only if the value is not directly stated but is strongly supported by source context plus standard ADC/oncology logic.
+13. status = UNSUPPORTED if there is not enough evidence.
+14. status = CONFLICT if sources disagree.
+15. status = UNKNOWN if no useful evidence is found.
+16. If status is SUPPORTED or INFERRED, evidence must not be empty.
+17. If status is SUPPORTED or INFERRED, source_url should be a direct public URL when available.
+18. Do not mark a value SUPPORTED just because it is a valid category.
+19. Fake-but-valid values must be marked UNSUPPORTED.
+
+SOURCE URL RULES:
+20. Always include the provided abstract_url in source_urls.
+21. Prefer direct public URLs: ASCO, ClinicalTrials.gov, PubMed, FDA, EMA, company pages, journal pages, press releases.
+22. Do not intentionally return Google redirect URLs or Vertex grounding redirect URLs.
+
+FIELD GUIDANCE:
+23. If product_id contains a combination, normalize the ADC asset, not the partner immunotherapy.
+24. For product fields, use product-level public evidence or strong ADC-class inference.
+25. For trial fields, use the specific abstract title, citation, trial, and public study context.
+26. For commercial fields, use reasonable industry inference based on asset_stage, trial_phase, indication, ADC class, and market size, but mark these as INFERRED unless directly sourced.
+
+INFERENCE HELP:
+27. If it is an antibody-drug conjugate, modality = ADC.
+28. If title says phase III / phase 3, asset_stage = phase_3 and trial_phase = phase_3.
+29. If title says phase II / phase 2, asset_stage = phase_2 and trial_phase = phase_2.
+30. If title says phase I/II or phase 1/2, trial_phase = phase_1_2.
+31. If title says metastatic triple-negative breast cancer, indication = mTNBC.
+32. If EGFR and HER3 are both mentioned, target_antigen = EGFRxHER3.
+33. If payload is Topo-I / topoisomerase I / deruxtecan / govitecan / SN-38 / DXd, use moa_class = Topo-I payload and payload_class = Topo-I.
+34. For Topo-I ADC payloads, payload_potency_bin is usually high.
+35. For PBD or duocarmycin payloads, payload_potency_bin is usually ultra_high.
+36. If DAR is around 7.5 to 8, dar_bin = 8.
+37. Q3W, every 3 weeks, or 21-day cycle means dosing_interval = q3w.
+38. If no boxed warning is found for an investigational asset, black_box_warning = none.
+39. If asset is ongoing or in development, outcome = active and discontinuation_reason = none.
+40. If asset is approved, outcome = approved and discontinuation_reason = none.
+41. If asset is discontinued, choose the best reason from toxicity, efficacy, commercial, manufacturing, strategic.
+
+BINNING:
+42. median_pfs_bin: <6 mo, 6-7.5 mo, 7.5-8.5 mo, 8.5-9.0 mo, >9.0 mo. If exactly 8.5 months, use 8.5-9.0 mo.
+43. orr_bin: <20%, 20-35%, 35-50%, 50-65%, >65%.
+44. severe_ild_bin: use severe / grade >=3 ILD only, not all-grade ILD.
+45. grade_3_4_neutropenia_bin: use grade 3/4 neutropenia only.
+46. grade_3_4_diarrhea_bin: use grade 3/4 diarrhea only.
+
+review_flag:
+- GOOD if most values are SUPPORTED and only a few are INFERRED.
+- REVIEW if several values are INFERRED or uncertain.
+- LOW_CONFIDENCE if many values are UNSUPPORTED, CONFLICT, or UNKNOWN.
+
+Return JSON only.
+"""
+    return prompt
+
+
+# ============================================================
+# VALIDATION WITH HALLUCINATION CHECK
+# ============================================================
+
+def validate_output(data, row, grounding_urls):
+    cleaned = {}
+    evidence_audit = {}
+    unsupported_fields = []
+
+    abstract_url = clean_value(row.get("abstract_url"))
+
+    for col in OUTPUT_COLUMNS:
+        cell = data.get(col, {})
+
+        if not isinstance(cell, dict):
+            cell = {
+                "value": cell,
+                "status": "UNKNOWN",
+                "evidence": "",
+                "source_url": "",
+            }
+
+        value = canonical_value(col, cell.get("value", UNKNOWN))
+        status = clean_value(cell.get("status", "UNKNOWN")).upper()
+        evidence = clean_value(cell.get("evidence", ""))
+        source_url = clean_value(cell.get("source_url", ""))
+
+        if status not in ["SUPPORTED", "INFERRED", "UNSUPPORTED", "CONFLICT", "UNKNOWN"]:
+            status = "UNKNOWN"
+
+        if value != UNKNOWN and status in ["SUPPORTED", "INFERRED"]:
+            if evidence == UNKNOWN:
+                value = UNKNOWN
+                status = "UNSUPPORTED"
+                unsupported_fields.append(col)
+
+            source_url = clean_source_url(
+                source_url,
+                fallback_url="" if abstract_url == UNKNOWN else abstract_url,
+            )
+
+        else:
+            value = UNKNOWN
+
+            if col not in unsupported_fields:
+                unsupported_fields.append(col)
+
+            source_url = clean_source_url(
+                source_url,
+                fallback_url="",
+            )
+
+        cleaned[col] = value
+
+        evidence_audit[col] = {
+            "status": status,
+            "evidence": "" if evidence == UNKNOWN else short_text(evidence, 250),
+            "source_url": "" if source_url == UNKNOWN else source_url,
+        }
+
+    # Row-level source URLs
+    urls = []
+
+    if abstract_url != UNKNOWN:
+        urls.append(abstract_url)
+
+    model_urls = data.get("source_urls", [])
+
+    if isinstance(model_urls, list):
+        for url in model_urls:
+            url = str(url).strip()
+            if url and not is_redirect_url(url) and url not in urls:
+                urls.append(url)
+
+    elif isinstance(model_urls, str):
+        for url in extract_urls_from_text(model_urls):
+            if url and not is_redirect_url(url) and url not in urls:
+                urls.append(url)
+
+    for item in evidence_audit.values():
+        url = item.get("source_url", "")
+        if url and not is_redirect_url(url) and url not in urls:
+            urls.append(url)
+
+    if not urls:
+        urls = grounding_urls[:3]
+
+    unsupported_fields = sorted(set(unsupported_fields))
+    unsupported_count = len(unsupported_fields)
+
+    if unsupported_count == 0:
+        review_flag = "GOOD"
+    elif unsupported_count <= 10:
+        review_flag = "REVIEW"
+    else:
+        review_flag = "LOW_CONFIDENCE"
+
+    cleaned["source_urls"] = "; ".join(urls[:5])
+    cleaned["review_flag"] = review_flag
+    cleaned["unsupported_fields"] = ", ".join(unsupported_fields)
+    cleaned["evidence_audit"] = safe_excel_text(
+        json.dumps(evidence_audit, ensure_ascii=False)
+    )
+
+    return cleaned
+
+
+# ============================================================
+# BUILD SECOND SHEET WITH SOURCE AFTER EACH COLUMN
+# ============================================================
+
+def build_output_with_sources_df(df):
+    rows = []
+
+    for _, row in df.iterrows():
+        new_row = {}
+
+        for col in INPUT_COLUMNS:
+            new_row[col] = row.get(col, "")
+
+        evidence_audit_raw = row.get("evidence_audit", "{}")
+
+        try:
+            evidence_audit = json.loads(evidence_audit_raw)
+        except Exception:
+            evidence_audit = {}
+
+        for col in OUTPUT_COLUMNS:
+            value = row.get(col, UNKNOWN)
+            new_row[col] = value
+
+            source_url = ""
+
+            if col in evidence_audit:
+                source_url = evidence_audit[col].get("source_url", "")
+
+            if (not source_url or source_url == UNKNOWN) and value != UNKNOWN:
+                source_url = row.get("abstract_url", "")
+
+            if value == UNKNOWN:
+                source_url = ""
+
+            new_row[f"{col}_source_url"] = source_url
+
+        new_row["review_flag"] = row.get("review_flag", "")
+        new_row["unsupported_fields"] = row.get("unsupported_fields", "")
+        new_row["source_urls"] = row.get("source_urls", "")
+
+        rows.append(new_row)
+
+    return pd.DataFrame(rows)
+
+
+def save_workbook(df):
+    source_df = build_output_with_sources_df(df)
+
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="normalized_output", index=False)
+        source_df.to_excel(writer, sheet_name="output_with_sources", index=False)
+
+
+# ============================================================
+# CALL GEMINI
+# ============================================================
+
+def call_gemini(row):
+    prompt = build_prompt(row)
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"Calling Gemini attempt {attempt}/{MAX_RETRIES}")
+
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=GenerateContentConfig(
+                    tools=[Tool(google_search=GoogleSearch())],
+                    temperature=0,
+                ),
+            )
+
+            response_text = getattr(response, "text", None)
+
+            print("Response preview:")
+            print(str(response_text)[:400])
+
+            grounding_urls = extract_grounding_urls(response)
+            data = extract_json(response_text)
+
+            return validate_output(data, row, grounding_urls)
+
+        except Exception as e:
+            last_error = e
+            print(f"Gemini failed: {e}")
+            print(traceback.format_exc())
+
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS * attempt)
+
+    raise RuntimeError(f"Gemini failed after retries: {last_error}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    try:
+        print("Reading Excel file...")
+
+        df = find_input_sheet()
+        df = df.dropna(how="all").reset_index(drop=True)
+
+        df = df[INPUT_COLUMNS].copy()
+
+        for col in OUTPUT_COLUMNS:
+            df[col] = UNKNOWN
+
+        for col in AUDIT_COLUMNS:
+            df[col] = ""
+
+        rows = df if MAX_ROWS_TO_PROCESS is None else df.head(MAX_ROWS_TO_PROCESS)
+
+        print(f"Rows selected: {len(rows)}")
+
+        for idx, row in rows.iterrows():
+            print("=" * 80)
+            print(f"Processing row {idx + 1}")
+            print(f"product_id: {row.get('product_id')}")
+
+            try:
+                result = call_gemini(row)
+
+                for col in OUTPUT_COLUMNS:
+                    df.loc[idx, col] = result[col]
+
+                for col in AUDIT_COLUMNS:
+                    df.loc[idx, col] = result[col]
+
+                unknown_count = sum(
+                    1 for col in OUTPUT_COLUMNS if df.loc[idx, col] == UNKNOWN
+                )
+
+                print(f"Unknown count: {unknown_count}")
+                print(f"Review flag: {result['review_flag']}")
+                print(f"Unsupported fields: {result['unsupported_fields']}")
+
+            except Exception as e:
+                print(f"ERROR row {idx + 1}: {e}")
+                print(traceback.format_exc())
+
+                abstract_url = clean_value(row.get("abstract_url"))
+
+                if abstract_url != UNKNOWN:
+                    df.loc[idx, "source_urls"] = abstract_url
+
+                df.loc[idx, "review_flag"] = "LOW_CONFIDENCE"
+
+            df = df[FINAL_COLUMNS]
+
+            save_workbook(df)
+
+            print(f"Saved progress: {OUTPUT_FILE}")
+
+            time.sleep(ROW_DELAY_SECONDS)
+
+        print("Done.")
+        print(f"Final file saved as: {OUTPUT_FILE}")
+        print("Sheets created: normalized_output, output_with_sources")
+
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        print(traceback.format_exc())
+
+
+if __name__ == "__main__":
+    main()
